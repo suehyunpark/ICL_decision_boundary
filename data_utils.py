@@ -11,10 +11,11 @@ def generate_x_y(
     seed,
     data_type="linear",
     factor=0.5,
-    class_sep=1,
+    class_sep=2,
     noise_moon=0.05,
     num_classes=2,
 ):
+    print("Seed:", seed)
     """Generate X and y data based on the specified data type."""
     if data_type == "linear":
         X, y = make_classification(
@@ -73,6 +74,16 @@ def generate_context_prompt(X, y, class_names):
     for features, label in zip(X, y_named):
         features_str = " ".join(f"{int(num)}" for num in np.round(features))
         prompt += f"Input: {features_str}\nLabel: {label}\n"
+    return prompt
+
+
+def generate_context_prompt_reverse(X, y, class_names):
+    y_named = [class_names[int(label)] for label in y]
+
+    prompt = ""
+    for features, label in zip(X, y_named):
+        features_str = " ".join(f"{int(num)}" for num in np.round(features))
+        prompt += f"Label: {label}\nInput: {features_str}\n"
     return prompt
 
 

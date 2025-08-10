@@ -12,7 +12,7 @@ from matplotlib.colors import ListedColormap
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from scipy import stats
-from data_utils import generate_tasks, generate_dataset, generate_context_prompt, generate_reasoning_prompt, get_hardwired_reasoning_prompt, parse_label
+from data_utils import generate_tasks, generate_dataset, generate_context_prompt, generate_context_prompt_reverse, generate_reasoning_prompt, get_hardwired_reasoning_prompt, parse_label
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -72,17 +72,21 @@ def expand_kv_cache(kv_cache, batch_size):
     Returns:
     tuple: The expanded KV cache.
     """
-    expanded_cache = []
+    # expanded_cache = []
     
-    for layer_cache in kv_cache:
-        expanded_layer = []
-        for tensor in layer_cache:
-            # Repeat the tensor along the batch dimension
-            expanded_tensor = tensor.repeat(batch_size, 1, 1, 1)
-            expanded_layer.append(expanded_tensor)
-        expanded_cache.append(tuple(expanded_layer))
+    # for layer_cache in kv_cache:
+    #     expanded_layer = []
+    #     for tensor in layer_cache:
+    #         # Repeat the tensor along the batch dimension
+    #         expanded_tensor = tensor.repeat(batch_size, 1, 1, 1)
+    #         expanded_layer.append(expanded_tensor)
+    #     expanded_cache.append(tuple(expanded_layer))
     
-    return tuple(expanded_cache)
+    # return tuple(expanded_cache)
+    return tuple(
+        tuple(tensor.expand(batch_size, -1, -1, -1) for tensor in layer)
+        for layer in kv_cache
+    )
 
 
 import os
@@ -91,7 +95,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 def plot_decision_boundary(
-    X_train, y_train, xx1, xx2, predictions, model_name="llama3-8b", num_in_context=50, num_in_context_reasoning=0, prompt_format=None, load_bit=None, grid_size=50, save_dir="figures/"
+    X_train, y_train, xx1, xx2, predictions, model_name="llama3-8b", num_in_context=50, num_in_context_reasoning=0, prompt_format=None, load_bit=None, reverse_inputs=False, save_dir="figures/"
 ):
     def create_file_name(model_name, num_in_context, save_dir, num_in_context_reasoning=0, prompt_format=None, load_bit=None):
         prefix = f"{model_name}_{num_in_context}incontext"
@@ -101,6 +105,8 @@ def plot_decision_boundary(
             prefix = f"{prefix}_{prompt_format}"
         if load_bit:
             prefix = f"{prefix}_{load_bit}bit"
+        if reverse_inputs:
+            prefix = f"{prefix}_reverse"
         file_name = os.path.join(save_dir, f"{prefix}.png")
         return file_name
 
@@ -163,7 +169,7 @@ def plot_decision_boundary(
     return file_name
 
 
-def create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt=None):
+def create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt=None, fixed_label: int=None):
     if "instruct" in args.model_name:
         # Llama instruction prompt format
         prompts = [
@@ -184,7 +190,10 @@ def create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, re
                 f"{system_prompt}\n{context_prompt}\n{query_prompt}\n{reasoning_prompt}\nInput: {inp}\nSteps: " for inp in inputs
             ]
         else:
-            prompts = [f"{system_prompt}\n{context_prompt}\n{query_prompt}\nInput: {inp}\nLabel: " for inp in inputs]
+            if fixed_label is not None:
+                prompts = [f"{system_prompt}\n{context_prompt}\n{query_prompt}\Label: {fixed_label}\nInput: {inp}" for inp in inputs]
+            else:
+                prompts = [f"{system_prompt}\n{context_prompt}\n{query_prompt}\nInput: {inp}\nLabel: " for inp in inputs]
     return prompts
 
 
@@ -207,7 +216,7 @@ def main():
         "--data_type", type=str, default="linear", help="Type of data to generate, linear, circle or moon"
     )
     parser.add_argument(
-        "--class_sep", type=float, default=1.0, help="Class separation for linearly separable data"
+        "--class_sep", type=float, default=2.5, help="Class separation for linearly separable data"
     )
     parser.add_argument(
         "--circle_factor", type=float, default=0.5, help="Circle factor for circular data generation"
@@ -219,6 +228,8 @@ def main():
     parser.add_argument("--plot_save_dir", type=str, default="figures/", help="Directory for saving the plot")
     parser.add_argument("--acc_save_dir", type=str, default="outputs/", help="Directory for saving the plot")
     parser.add_argument("--log_dir", type=str, default="logs/", help="Directory for logging generation results")
+    
+    parser.add_argument("--reverse_inputs", action="store_true", help="Reverse the input-label order")
     
     args = parser.parse_args()
 
@@ -248,16 +259,36 @@ def main():
         class_sep=args.class_sep,
         factor=args.circle_factor,
     )
-    meta_train_X, meta_test_X, meta_train_y, meta_test_y = train_test_split(  # maybe used for training the model later?
-        dataset_x, dataset_y, train_size=args.train_ratio
-    )
+    # meta_train_X, meta_test_X, meta_train_y, meta_test_y = train_test_split(  # maybe used for training the model later?
+    #     dataset_x, dataset_y, train_size=args.train_ratio  # currently randomly splits; not train-test sequential split
+    # )
+    meta_train_X, meta_train_y = dataset_x, dataset_y  # use all data for training
 
+    
+    # def plot_scatter(x, y, labels):
+    #     plt.figure(figsize=(10, 8))
+    #     plt.scatter(x[labels == 0], y[labels == 0], c='red', label='Label 0')
+    #     plt.scatter(x[labels == 1], y[labels == 1], c='blue', label='Label 1')
+    #     plt.xlabel('X')
+    #     plt.ylabel('Y')
+    #     plt.title(f'Scatter Plot of Input Data (Seed {args.seed})')
+    #     plt.legend()
+    #     plt.grid(True)
+    #     plt.savefig(f"{args.plot_save_dir}/seed{args.seed}_task0.png", dpi=300)
+        
+    
     print(f"Meta_train_X shape: {meta_train_X.shape}")
-    print(f"Meta_test_X shape: {meta_test_X.shape}")
+    # print(f"Meta_test_X shape: {meta_test_X.shape}")
+    print(f"Meta_train_y shape: {meta_train_y.shape}")
+    # plot_scatter(meta_train_X[0, :, 0], meta_train_X[0, :, 1], meta_train_y[0])
     print("-" * 50)
 
-    system_prompt = f"Given pairs of numbers and their labels, predict the label for a new input pair of numbers based on the provided data. Answer with only one of the labels '{class_names[0]}' and '{class_names[1]}'."
-    query_prompt = "What is the label for this input?"
+    if args.reverse_inputs:
+        system_prompt = f"Given labels and pairs of numbers for the labels, predict the input pair of numbers for a new label based on the provided data. Try to get the best estimate of what the pair of numbers would be. Answer with only positive integers."
+        query_prompt = "What is the input for this label?"
+    else:
+        system_prompt = f"Given pairs of numbers and their labels, predict the label for a new input pair of numbers based on the provided data. Answer with only one of the labels '{class_names[0]}' and '{class_names[1]}'."
+        query_prompt = "What is the label for this input?"
 
     context_x, context_y, query_x, query_y, reasoning_x, reasoning_y = generate_dataset(args, meta_train_X, meta_train_y)
 
@@ -298,7 +329,10 @@ def main():
         xx1_flat, xx2_flat = xx1.ravel(), xx2.ravel()
         inputs = [f"{int(x)} {int(y)}" for x, y in zip(xx1_flat, xx2_flat)]  # actual x, y coordinates
 
-        context_prompt = generate_context_prompt(X=task_context_x, y=task_context_y, class_names=class_names)
+        if args.reverse_inputs:
+            context_prompt = generate_context_prompt_reverse(X=task_context_x, y=task_context_y, class_names=class_names)
+        else:
+            context_prompt = generate_context_prompt(X=task_context_x, y=task_context_y, class_names=class_names)
         if args.num_in_context_reasoning > 0:
             if args.reasoning_set:
                 reasoning_prompt = get_hardwired_reasoning_prompt()
@@ -309,8 +343,15 @@ def main():
                 break
         else:
             reasoning_prompt = None
-        prompts = create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt)
-        print(f"Prompt sample in {task_idx}'th task:\n{prompts[0]}")
+        
+        if args.reverse_inputs:
+            prompts_0 = create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt, fixed_label=0)
+            prompts_1 = create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt, fixed_label=1)
+            print(f"Prompt sample in {task_idx}'th task:\n{prompts_0[0]}")
+            print(f"Prompt sample in {task_idx}'th task:\n{prompts_1[0]}")
+        else:
+            prompts = create_prompts(args, system_prompt, context_prompt, query_prompt, inputs, reasoning_prompt)
+            print(f"Prompt sample in {task_idx}'th task:\n{prompts[0]}")
 
         # Store the KV cache for the in-context examples to speed up.
         inputs_ids = tokenizer(inputs, return_tensors="pt", padding=True, truncation=False)["input_ids"]
@@ -319,7 +360,7 @@ def main():
         predictions = np.zeros(xx1_flat.shape[0])
         logits_pred = np.zeros((xx1_flat.shape[0], 2))
 
-        prompt_input_ids = tokenizer(prompts[0], return_tensors="pt", padding=True, truncation=False)[
+        prompt_input_ids = tokenizer(prompts[0] if not args.reverse_inputs else prompts_0[0], return_tensors="pt", padding=True, truncation=False)[
             "input_ids"
         ]
         in_context_ids = prompt_input_ids[:, :-max_input_len].to(model.device)
@@ -330,76 +371,147 @@ def main():
         
         # Decision boundary plotting
         if task_idx == 0:  # only plot the decision boundary for the first task
-            for i in tqdm(range(0, len(prompts), args.batch_size)):
-                batch_prompts = prompts[i : i + args.batch_size]
-                batch_size = len(batch_prompts)  # batch size may not be equal to args.batch_size for the last batch
+            if args.reverse_inputs:
+                def calculate_input_logprobs(prompts):
+                    log_probs = []
+                    for i in tqdm(range(0, len(prompts), args.batch_size)):
+                        batch_prompts = prompts[i : i + args.batch_size]
+                        
+                        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=False).to(model.device)
+                        input_ids = inputs["input_ids"].to(model.device)
+                        attention_mask = inputs["attention_mask"]
+                        
+                        # Split the input_ids into context and question parts
+                        context_length = in_context_kv_cache[0][0].shape[2]  # Get the length of the cached context
+                        
+                        # Adjust input_ids and attention_mask to only include the new tokens
+                        input_ids = input_ids[:, context_length:]
+                        attention_mask = attention_mask[:, context_length:]
+                        
+                        # Ensure that we're only processing the last few tokens if the input is too long
+                        max_new_tokens = 10  # Adjust this value as needed
+                        if input_ids.shape[1] > max_new_tokens:
+                            input_ids = input_ids[:, -max_new_tokens:]
+                            attention_mask = attention_mask[:, -max_new_tokens:]
+                            
+                        # Expand the in_context_kv_cache to match the batch size
+                        expanded_kv_cache = expand_kv_cache(in_context_kv_cache, args.batch_size)
 
-                total_prompt = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=False)[
-                    "input_ids"
-                ].to(model.device)
-                prompt_length = total_prompt.shape[1]
-                this_in_context_ids = total_prompt[:, : len(in_context_ids[0])]
-                question_ids = total_prompt[:, len(in_context_ids[0]) :]
-                
-                assert torch.equal(this_in_context_ids[0], in_context_ids[0])
-                
-                in_context_kv_cache_expanded = expand_kv_cache(in_context_kv_cache, batch_size)
-                with torch.inference_mode():
-                    in_context_q_kv_cache = model(
-                        question_ids[:, :-1], past_key_values=in_context_kv_cache_expanded, return_dict=True
-                    ).past_key_values
+                        with torch.inference_mode():
+                            # Use the expanded KV cache to get the outputs for the question part
+                            outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                past_key_values=expanded_kv_cache,
+                                use_cache=False,  # Set this to False to avoid issues with mismatched sizes
+                                return_dict=True
+                            )
+                        
+                        # Get the logits for the last three tokens (corresponding to the input pair and space)
+                        last_token_logits = outputs.logits[:, -3:, :]
+                        
+                        # Calculate log probabilities
+                        log_probs_batch = F.log_softmax(last_token_logits, dim=-1)
+                        
+                        # Get the log probs for the actual tokens
+                        actual_log_probs = log_probs_batch.gather(2, input_ids[:, -3:].unsqueeze(-1)).squeeze(-1)
+                        
+                        # Sum the log probs for each input pair, excluding the space
+                        # Assuming the space is always in the middle, we sum the first and last log prob
+                        pair_log_probs = actual_log_probs[:, 0] + actual_log_probs[:, 2]
+                        
+                        # Sum the log probs for each input pair
+                        log_probs.extend(pair_log_probs.tolist())
+                    
+                    return log_probs
 
-                    generations = model.generate(
-                        input_ids=total_prompt,
-                        do_sample=False,
-                        max_new_tokens=max_new_tokens,
-                        min_new_tokens=min_new_tokens,
-                        past_key_values=in_context_q_kv_cache,
-                        pad_token_id=tokenizer.eos_token_id,
-                        output_scores=True,
-                        return_dict_in_generate=True,
-                        output_attentions=True,
-                    )
-                    logits = generations["scores"][-1]
-                if not args.reasoning_set:
-                    logit_bar = max(logits[0, token_ids_bar].item(), logits[0, token_ids_bar1].item())
-                    logit_foo = max(logits[0, token_ids_foo].item(), logits[0, token_ids_foo1].item())
-                    generated_texts = tokenizer.batch_decode(
-                        generations["sequences"][:, -1:], skip_special_tokens=True  # only check last token
-                    )
-                else:
-                    generated_sequences = generations["sequences"][:, prompt_length:]
-                    generated_texts = tokenizer.batch_decode(
-                        generated_sequences, skip_special_tokens=True
-                    )
-                for idx, (generated_text, x_val, y_val) in enumerate(
-                    zip(generated_texts, xx1_flat[i : i + batch_size], xx2_flat[i : i + batch_size])
-                ):
-                    print(f"idx: {i + idx}, x: {x_val}, y: {y_val}")
-                    print(f"Generated text: {generated_text}")
-                    if args.reasoning_set:
-                        label = parse_label(generated_text)
-                        predictions[i + idx] = label
-                        samples_decision.append({
-                            "task_idx": task_idx,
-                            "idx": i + idx,
-                            "inputs": f"{int(x_val)} {int(y_val)}",
-                            "generated_text": generated_text,
-                            "prediction": label
-                        })
-                    # Check if the generated text contains the class names, if not, use the logit to predict
+                log_probs_0 = calculate_input_logprobs(prompts_0)
+                log_probs_1 = calculate_input_logprobs(prompts_1)
+
+                # Compare log probabilities and make predictions
+                predictions = []
+                logits_pred = []
+                for lp0, lp1 in zip(log_probs_0, log_probs_1):
+                    if lp0 > lp1:
+                        predictions.append(0)
+                        logits_pred.append([lp0, lp1])
                     else:
-                        if class_names[0].lower() in generated_text.lower():
-                            predictions[i + idx] = 0
-                        elif class_names[1].lower() in generated_text.lower():
-                            predictions[i + idx] = 1
+                        predictions.append(1)
+                        logits_pred.append([lp1, lp0])
+
+                predictions = np.array(predictions)
+                logits_pred = np.array(logits_pred)
+            else:
+                for i in tqdm(range(0, len(prompts), args.batch_size)):
+                    batch_prompts = prompts[i : i + args.batch_size]
+                    batch_size = len(batch_prompts)  # batch size may not be equal to args.batch_size for the last batch
+
+                    total_prompt = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=False)[
+                        "input_ids"
+                    ].to(model.device)
+                    prompt_length = total_prompt.shape[1]
+                    this_in_context_ids = total_prompt[:, : len(in_context_ids[0])]
+                    question_ids = total_prompt[:, len(in_context_ids[0]) :]
+                    
+                    assert torch.equal(this_in_context_ids[0], in_context_ids[0])
+                    
+                    in_context_kv_cache_expanded = expand_kv_cache(in_context_kv_cache, batch_size)
+                    with torch.inference_mode():
+                        in_context_q_kv_cache = model(
+                            question_ids[:, :-1], past_key_values=in_context_kv_cache_expanded, return_dict=True
+                        ).past_key_values
+
+                        generations = model.generate(
+                            input_ids=total_prompt,
+                            do_sample=False,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            past_key_values=in_context_q_kv_cache,
+                            pad_token_id=tokenizer.eos_token_id,
+                            output_scores=True,
+                            return_dict_in_generate=True,
+                            output_attentions=True,
+                        )
+                        logits = generations["scores"][-1]
+                    if not args.reasoning_set:
+                        logit_bar = max(logits[0, token_ids_bar].item(), logits[0, token_ids_bar1].item())
+                        logit_foo = max(logits[0, token_ids_foo].item(), logits[0, token_ids_foo1].item())
+                        generated_texts = tokenizer.batch_decode(
+                            generations["sequences"][:, -1:], skip_special_tokens=True  # only check last token
+                        )
+                    else:
+                        generated_sequences = generations["sequences"][:, prompt_length:]
+                        generated_texts = tokenizer.batch_decode(
+                            generated_sequences, skip_special_tokens=True
+                        )
+                    for idx, (generated_text, x_val, y_val) in enumerate(
+                        zip(generated_texts, xx1_flat[i : i + batch_size], xx2_flat[i : i + batch_size])
+                    ):
+                        print(f"idx: {i + idx}, x: {x_val}, y: {y_val}")
+                        print(f"Generated text: {generated_text}")
+                        if args.reasoning_set:
+                            label = parse_label(generated_text)
+                            predictions[i + idx] = label
+                            samples_decision.append({
+                                "task_idx": task_idx,
+                                "idx": i + idx,
+                                "inputs": f"{int(x_val)} {int(y_val)}",
+                                "generated_text": generated_text,
+                                "prediction": label
+                            })
+                        # Check if the generated text contains the class names, if not, use the logit to predict
                         else:
-                            if logit_bar > logit_foo:
-                                predictions[i + idx] = 1
-                                logits_pred[i + idx] = [logit_bar, logit_foo]
-                            else:
+                            if class_names[0].lower() in generated_text.lower():
                                 predictions[i + idx] = 0
-                                logits_pred[i + idx] = [logit_foo, logit_bar]
+                            elif class_names[1].lower() in generated_text.lower():
+                                predictions[i + idx] = 1
+                            else:
+                                if logit_bar > logit_foo:
+                                    predictions[i + idx] = 1
+                                    logits_pred[i + idx] = [logit_bar, logit_foo]
+                                else:
+                                    predictions[i + idx] = 0
+                                    logits_pred[i + idx] = [logit_foo, logit_bar]
 
             llm_predictions = predictions.reshape(xx1.shape)
             file_name = plot_decision_boundary(
@@ -413,7 +525,7 @@ def main():
                 num_in_context_reasoning=args.num_in_context_reasoning,
                 prompt_format=args.exp_name,
                 load_bit=args.load_bit,
-                grid_size=args.grid_size,
+                reverse_inputs=args.reverse_inputs,
                 save_dir=args.plot_save_dir,
             )
             print(f"Decision boundary plot saved as {file_name}")
